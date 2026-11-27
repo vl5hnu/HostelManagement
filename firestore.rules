@@ -1,0 +1,338 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    function signedIn() {
+      return request.auth != null;
+    }
+
+    // The role lives in the user's own profile, which a student cannot edit
+    // (see the users rules below), so nobody can promote themselves.
+    function isSuperAdmin() {
+      return signedIn()
+        && get(/databases/$(database)/documents/users/$(request.auth.uid)).data.role == 'super_admin';
+    }
+
+    // The super admin can read and write every collection.
+    match /{document=**} {
+      allow read, write: if isSuperAdmin();
+    }
+
+    // Everything below is what a student may do.
+
+    match /users/{uid} {
+      // A user can read their own profile.
+      allow read: if signedIn() && request.auth.uid == uid;
+
+      // Self sign-up is only possible as a pending student.
+      allow create: if signedIn()
+        && request.auth.uid == uid
+        && request.resource.data.role == 'student'
+        && request.resource.data.status == 'pending';
+    }
+
+    // A student who registered through the app has their login uid as the
+    // record id, so they can read their own hostel record.
+    match /students/{studentId} {
+      allow read: if signedIn() && request.auth.uid == studentId;
+    }
+
+    // The mess admin's settings, such as the UPI ID for mess fees. Any
+    // signed-in user can read them (students need the UPI ID to pay).
+    match /mess_settings/{settingId} {
+      allow read: if signedIn();
+    }
+
+    // Hostel details and rates are shared information; any signed-in user
+    // may read them. Only the super admin can change them.
+    match /hostel_settings/{settingId} {
+      allow read: if signedIn();
+    }
+
+    // A student can read their own bills and nothing else about billing.
+    // Only the hostel office writes bills.
+    match /hostel_bills/{billId} {
+      allow read: if signedIn() && resource.data.studentId == request.auth.uid;
+    }
+    match /mess_bills/{billId} {
+      allow read: if signedIn() && resource.data.studentId == request.auth.uid;
+    }
+
+    function isOwner() {
+      return signedIn() && resource.data.studentId == request.auth.uid;
+    }
+
+    function creatingOwn() {
+      return signedIn() && request.resource.data.studentId == request.auth.uid;
+    }
+
+    // The shortest vacation the office accepts, from settings (10 if unset).
+    function vacationMinDays() {
+      return exists(/databases/$(database)/documents/hostel_settings/main)
+        ? get(/databases/$(database)/documents/hostel_settings/main).data.vacationMinDays
+        : 10;
+    }
+
+    // Vacation applications. A student can apply, as pending only, for a
+    // vacation of at least the minimum length. Only the office can decide
+    // it, and only the office sets the mess deduction.
+    match /leaves/{leaveId} {
+      allow read: if isOwner();
+      allow create: if creatingOwn()
+        && request.resource.data.status == 'pending'
+        && !('approvedUntil' in request.resource.data)
+        && !('decidedBy' in request.resource.data)
+        && !('deductionAmount' in request.resource.data)
+        && !('deductionApplied' in request.resource.data)
+        && (request.resource.data.toDate.toMillis()
+            - request.resource.data.fromDate.toMillis()) / 86400000 + 1
+            >= vacationMinDays();
+      // A student may delete their own request only while it is pending.
+      allow delete: if isOwner() && resource.data.status == 'pending';
+    }
+
+    // True when the payment being created is for the student's own bill in
+    // [collection] and is for exactly what that bill still owes.
+    function paysOwnBillInFull(collection) {
+      let bill = get(/databases/$(database)/documents/$(collection)/$(request.resource.data.billId)).data;
+      return bill.studentId == request.auth.uid
+        && bill.balance > 0
+        && request.resource.data.amount == bill.balance;
+    }
+
+    // Payments. A student can only say "I have paid this bill", as awaiting
+    // verification and for the bill's exact balance. They can never mark a
+    // payment as paid or change one afterwards; only the office confirms it.
+    match /payments/{paymentId} {
+      allow read: if isOwner();
+      allow create: if creatingOwn()
+        && request.resource.data.status == 'awaiting_verification'
+        && request.resource.data.byOffice == false
+        && !('verifiedBy' in request.resource.data)
+        && ((request.resource.data.kind == 'hostel'
+              && paysOwnBillInFull('hostel_bills'))
+            || (request.resource.data.kind == 'mess'
+              && paysOwnBillInFull('mess_bills')));
+      // While waiting on the cash screen, the student's app says it is still
+      // open. Nothing else about the payment can change.
+      allow update: if isOwner()
+        && resource.data.status == 'awaiting_verification'
+        && request.resource.data.diff(resource.data).affectedKeys()
+            .hasOnly(['liveAt']);
+      // Leaving the cash screen withdraws a request the office has not
+      // handled yet.
+      allow delete: if isOwner()
+        && resource.data.status == 'awaiting_verification'
+        && resource.data.byOffice == false;
+    }
+
+    // Complaints and maintenance requests. Private to the student and the
+    // office. A student can raise one, and reopen their own resolved one.
+    match /complaints/{complaintId} {
+      allow read: if isOwner();
+      allow create: if creatingOwn()
+        && request.resource.data.status == 'pending'
+        && request.resource.data.adminNote == '';
+      allow update: if isOwner()
+        && resource.data.status == 'resolved'
+        && request.resource.data.status == 'pending'
+        && request.resource.data.diff(resource.data).affectedKeys()
+            .hasOnly(['status', 'reopenedAt', 'updatedAt']);
+    }
+
+    // Students see a notice only while it is published; drafts and archived
+    // notices stay with the office.
+    match /notices/{noticeId} {
+      allow read: if signedIn() && resource.data.status == 'published';
+    }
+
+    // Menus are set by the office and readable by every signed-in user.
+    match /meal_items/{itemId} {
+      allow read: if signedIn();
+    }
+
+    // The weekly mess menu: everyone can read it.
+    match /mess_menu/{docId} {
+      allow read: if signedIn();
+    }
+
+    // Meal orders. The price and total are checked against the menu here, so
+    // a modified app cannot order at a different price. A student can cancel
+    // their own order only while it is still pending.
+    match /meal_orders/{orderId} {
+      allow read: if isOwner();
+      allow create: if creatingOwn()
+        && request.resource.data.status == 'pending'
+        && request.resource.data.billed == false
+        && request.resource.data.quantity is int
+        && request.resource.data.quantity >= 1
+        && request.resource.data.quantity <= 20
+        && get(/databases/$(database)/documents/meal_items/$(request.resource.data.itemId)).data.available == true
+        && request.resource.data.unitPrice
+            == get(/databases/$(database)/documents/meal_items/$(request.resource.data.itemId)).data.price
+        && request.resource.data.total
+            == request.resource.data.unitPrice * request.resource.data.quantity;
+      allow update: if isOwner()
+        && resource.data.status == 'pending'
+        && request.resource.data.status == 'cancelled'
+        && request.resource.data.diff(resource.data).affectedKeys()
+            .hasOnly(['status', 'updatedAt']);
+    }
+
+    // A user sees only their own notifications and may only mark them read.
+    match /notifications/{notificationId} {
+      allow read: if signedIn() && resource.data.recipientId == request.auth.uid;
+      allow update: if signedIn()
+        && resource.data.recipientId == request.auth.uid
+        && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['read']);
+    }
+
+    // ------------------------------------------------------------------
+    // The mess admin: the mess, mess fees, mess complaints, their own
+    // notices, and read-only student leave. Nothing about registrations,
+    // rooms, hostel rent or settings. Rules add up, so each block below only
+    // grants extra access on top of the ones above.
+
+    function isMessAdmin() {
+      let me = get(/databases/$(database)/documents/users/$(request.auth.uid)).data;
+      return signedIn() && me.role == 'mess_admin' && me.status == 'approved';
+    }
+
+    // Student records, for names and rooms on orders and in the report.
+    match /students/{studentId} {
+      allow read: if isMessAdmin();
+    }
+
+    // Student logins only, so publishing a notice can tell every student.
+    match /users/{uid} {
+      allow read: if isMessAdmin() && resource.data.role == 'student';
+    }
+
+    // Leave is read-only: the mess sees who is away but cannot decide.
+    match /leaves/{leaveId} {
+      allow read: if isMessAdmin();
+    }
+
+    // Mess bills: read, and reduce the balance when a payment is taken.
+    // The amount paid can only go up, and the balance must stay in step.
+    match /mess_bills/{billId} {
+      allow read: if isMessAdmin();
+      allow update: if isMessAdmin()
+        && request.resource.data.diff(resource.data).affectedKeys()
+            .hasOnly(['paid', 'balance', 'status', 'openDueDate'])
+        && request.resource.data.paid > resource.data.paid
+        && request.resource.data.balance
+            == resource.data.total - request.resource.data.paid
+        && request.resource.data.balance >= 0;
+    }
+
+    // Mess payments only. A mess admin can confirm or reject a student's
+    // payment, or record one taken in person, but a confirmed payment can
+    // never be changed afterwards.
+    match /payments/{paymentId} {
+      allow read: if isMessAdmin() && resource.data.kind == 'mess';
+      allow create: if isMessAdmin()
+        && request.resource.data.kind == 'mess'
+        && request.resource.data.status == 'paid'
+        && request.resource.data.byOffice == true
+        && request.resource.data.verifiedBy == request.auth.uid;
+      allow update: if isMessAdmin()
+        && resource.data.kind == 'mess'
+        && resource.data.status == 'awaiting_verification'
+        && request.resource.data.status in ['paid', 'rejected']
+        && request.resource.data.verifiedBy == request.auth.uid
+        && request.resource.data.diff(resource.data).affectedKeys()
+            .hasOnly(['status', 'rejectReason', 'verifiedBy', 'verifiedAt']);
+    }
+
+    // Commission to the hostel owner. The mess admin can only say "I have
+    // paid", as awaiting approval; only the super admin approves. While on
+    // the cash waiting screen they may refresh liveAt, and leaving it
+    // withdraws a request that has not been handled.
+    match /commission_payments/{paymentId} {
+      allow read: if isMessAdmin();
+      allow create: if isMessAdmin()
+        && request.resource.data.messAdminId == request.auth.uid
+        && request.resource.data.status == 'awaiting_verification'
+        && request.resource.data.byOffice == false
+        && request.resource.data.amount is int
+        && request.resource.data.amount > 0
+        && !('verifiedBy' in request.resource.data);
+      allow update: if isMessAdmin()
+        && resource.data.messAdminId == request.auth.uid
+        && resource.data.status == 'awaiting_verification'
+        && request.resource.data.diff(resource.data).affectedKeys()
+            .hasOnly(['liveAt']);
+      allow delete: if isMessAdmin()
+        && resource.data.messAdminId == request.auth.uid
+        && resource.data.status == 'awaiting_verification';
+    }
+
+    // The mess admin manages the UPI ID students pay mess fees to.
+    match /mess_settings/{settingId} {
+      allow write: if isMessAdmin();
+    }
+
+    // Monthly collection totals: a mess admin can only add mess money.
+    match /fee_summaries/{month} {
+      allow read: if isMessAdmin();
+      allow create: if isMessAdmin()
+        && request.resource.data.keys()
+            .hasOnly(['collectedPaise', 'messCollectedPaise']);
+      allow update: if isMessAdmin()
+        && request.resource.data.diff(resource.data).affectedKeys()
+            .hasOnly(['collectedPaise', 'messCollectedPaise']);
+    }
+
+    // Menus and orders for guest meals, extra meals and tiffin.
+    match /meal_items/{itemId} {
+      allow write: if isMessAdmin();
+    }
+
+    // The weekly menu and meal times.
+    match /mess_menu/{docId} {
+      allow write: if isMessAdmin();
+    }
+    match /meal_orders/{orderId} {
+      allow read: if isMessAdmin();
+      allow update: if isMessAdmin()
+        && request.resource.data.diff(resource.data).affectedKeys()
+            .hasOnly(['status', 'updatedAt']);
+    }
+
+    // Mess Quality complaints only: read, reply and resolve.
+    match /complaints/{complaintId} {
+      allow read: if isMessAdmin()
+        && resource.data.category == 'Mess Quality';
+      allow update: if isMessAdmin()
+        && resource.data.category == 'Mess Quality'
+        && request.resource.data.diff(resource.data).affectedKeys()
+            .hasOnly(['status', 'adminNote', 'updatedAt', 'resolvedAt']);
+    }
+
+    // Notices: every published one, plus their own. They can write and
+    // publish notices, and change or delete only the ones they wrote.
+    match /notices/{noticeId} {
+      allow read: if isMessAdmin()
+        && (resource.data.status == 'published'
+            || resource.data.createdBy == request.auth.uid);
+      allow create: if isMessAdmin()
+        && request.resource.data.createdBy == request.auth.uid;
+      allow update: if isMessAdmin()
+        && resource.data.createdBy == request.auth.uid
+        && request.resource.data.createdBy == request.auth.uid;
+      allow delete: if isMessAdmin()
+        && resource.data.createdBy == request.auth.uid;
+    }
+
+    // Notifications to students (decisions, orders, notices), and entries in
+    // the activity log in their own name.
+    match /notifications/{notificationId} {
+      allow create: if isMessAdmin();
+    }
+    match /activity_logs/{logId} {
+      allow create: if isMessAdmin()
+        && request.resource.data.actorId == request.auth.uid;
+    }
+  }
+}
